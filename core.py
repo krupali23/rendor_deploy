@@ -1,7 +1,9 @@
 # core.py
 import os
-from pathlib import Path
+import math
 import unicodedata
+from pathlib import Path
+from typing import Optional, Literal, Tuple
 import pandas as pd
 
 # ----------------------------
@@ -31,7 +33,7 @@ def resolve_data_dir() -> Path:
 DATA_DIR = resolve_data_dir()
 
 # ----------------------------
-# Districts + normalization
+# Berlin district centroids
 # ----------------------------
 DISTRICT_CENTROIDS = {
     "mitte": (52.5200, 13.4050),
@@ -59,18 +61,17 @@ DISTRICT_CENTROIDS = {
 def _normalize_text(s: str) -> str:
     if not isinstance(s, str):
         return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = s.encode("ascii", "ignore").decode("ascii")
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     s = s.lower()
     for ch in "-_\\/.,":
         s = s.replace(ch, " ")
     s = "".join(ch for ch in s if ch.isalnum() or ch.isspace())
     return " ".join(part for part in s.split() if part)
 
-_NORMALIZED_DISTRICT_MAP = { _normalize_text(k): k for k in DISTRICT_CENTROIDS.keys() }
+_NORMALIZED_DISTRICT_MAP = {_normalize_text(k): k for k in DISTRICT_CENTROIDS.keys()}
 DISTRICT_KEYS = sorted(_NORMALIZED_DISTRICT_MAP.keys(), key=len, reverse=True)
 
-def detect_district(text: str):
+def detect_district(text: str) -> Optional[str]:
     if not isinstance(text, str):
         return None
     norm = _normalize_text(text)
@@ -104,6 +105,17 @@ def bake_coords(df_in: pd.DataFrame) -> pd.DataFrame:
                 df.at[i, "district"] = d.title()
     return df
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    try:
+        r = 6371.0
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return r * c
+    except Exception:
+        return float("inf")
+
 def _smart_read(path: Path) -> pd.DataFrame:
     for enc in ("utf-8", "latin-1"):
         try:
@@ -114,14 +126,14 @@ def _smart_read(path: Path) -> pd.DataFrame:
 
 def load_data(data_dir: Path | None = None) -> pd.DataFrame:
     data_dir = Path(data_dir) if data_dir else DATA_DIR
-    # prefer *_geo.csv if present
+
     ev_base = data_dir / "berlin_tech_events.csv"
-    ev_geo = data_dir / (ev_base.stem + "_geo.csv")
-    events = _smart_read(ev_geo if ev_geo.exists() else ev_base)
+    ev_geo  = data_dir / (ev_base.stem + "_geo.csv")
+    events  = _smart_read(ev_geo if ev_geo.exists() else ev_base)
 
     jb_base = data_dir / "berlin_tech_jobs.csv"
-    jb_geo = data_dir / (jb_base.stem + "_geo.csv")
-    jobs = _smart_read(jb_geo if jb_geo.exists() else jb_base)
+    jb_geo  = data_dir / (jb_base.stem + "_geo.csv")
+    jobs    = _smart_read(jb_geo if jb_geo.exists() else jb_base)
 
     courses = _smart_read(data_dir / "german_courses_berlin.csv")
 
@@ -133,31 +145,93 @@ def load_data(data_dir: Path | None = None) -> pd.DataFrame:
     merged = bake_coords(merged)
     return merged
 
-def search(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    q = (query or "").lower()
-    topic = None
-    if "job" in q:
-        topic = "job"
-    elif "event" in q:
-        topic = "event"
-    elif "course" in q or "german" in q:
-        topic = "course"
-
-    loc_key = detect_district(q)
-    keywords = ["developer", "engineer", "data", "design", "marketing", "teacher", "python", "manager"]
-    keyword = next((k for k in keywords if k in q), None)
-
+def search(
+    df: pd.DataFrame,
+    query: Optional[str] = None,
+    topic: Optional[Literal["job","event","course"]] = None,
+    district: Optional[str] = None,
+    scope: Optional[Literal["all","only","nearby"]] = "all",
+    radius_km: float = 3.0,
+    use_my_location: bool = False,
+    origin_lat: Optional[float] = None,
+    origin_lon: Optional[float] = None,
+    keyword: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[Literal["asc","desc"]] = "asc",
+) -> pd.DataFrame:
+    """
+    Server-side version of your Streamlit filtering, including:
+    - topic filter
+    - district detection + scope ("all", "only", "nearby")
+    - nearby radius with optional user coordinates
+    - keyword filter
+    - optional sort
+    """
     subset = df.copy()
-    if topic:
-        subset = subset[subset["type"] == topic]
-    if loc_key:
-        subset = subset[
-            subset["district"].fillna("").str.lower().str.contains(loc_key)
-            | subset["location"].fillna("").str.lower().str.contains(loc_key)
-        ]
+
+    # infer district from query if not provided
+    if (not district) and query:
+        district = detect_district(query)
+
+    # topic
+    if topic and "type" in subset.columns:
+        subset = subset[subset["type"].astype(str).str.lower() == topic]
+
+    # keyword detection (fallback to your keyword list if not given)
+    if (not keyword) and query:
+        keys = ["developer","engineer","data","design","marketing","teacher","python","manager"]
+        ql = query.lower()
+        keyword = next((k for k in keys if k in ql), None)
+
+    # district + scope
+    if district:
+        dkey = district.lower()
+        if scope == "only":
+            subset = subset[
+                subset["district"].fillna("").str.lower().str.contains(dkey)
+                | subset["location"].fillna("").str.lower().str.contains(dkey)
+            ]
+        elif scope == "nearby":
+            # get origin: either user-provided or district centroid
+            if use_my_location and origin_lat is not None and origin_lon is not None:
+                lat0, lon0 = float(origin_lat), float(origin_lon)
+            else:
+                lat0, lon0 = DISTRICT_CENTROIDS.get(dkey, DISTRICT_CENTROIDS["berlin"])
+            subset = bake_coords(subset)
+            mask = []
+            for _, r in subset.iterrows():
+                try:
+                    lat = float(r.get("latitude", lat0))
+                    lon = float(r.get("longitude", lon0))
+                    dkm = _haversine_km(lat0, lon0, lat, lon)
+                    mask.append(dkm <= float(radius_km))
+                except Exception:
+                    mask.append(False)
+            subset = subset.loc[mask]
+        else:
+            # 'all' → no filtering by district
+            pass
+
+    # explicit keyword filter
     if keyword:
-        search_cols = [c for c in ["title", "company", "provider", "course_name"] if c in subset.columns]
-        subset = subset[
-            subset[search_cols].apply(lambda x: x.astype(str).str.lower().str.contains(keyword).any(), axis=1)
-        ]
-    return bake_coords(subset)
+        cols = [c for c in ["title","company","provider","course_name"] if c in subset.columns]
+        if cols:
+            k = keyword.lower()
+            subset = subset[subset[cols].apply(lambda x: x.astype(str).str.lower().str.contains(k).any(), axis=1)]
+
+    # free-text query fallback across many columns
+    if query:
+        q = query.lower()
+        cols = [c for c in ["title","course_name","provider","company","district","location","address"] if c in subset.columns]
+        if cols:
+            m = subset[cols].apply(lambda x: x.astype(str).str.lower().str.contains(q).any(), axis=1)
+            subset = subset[m]
+
+    # ensure coords for clients that map
+    subset = bake_coords(subset)
+
+    # optional sorting
+    if sort_by and sort_by in subset.columns:
+        subset = subset.sort_values(sort_by, ascending=(sort_dir != "desc"))
+
+    return subset
