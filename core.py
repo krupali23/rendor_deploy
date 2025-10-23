@@ -1,9 +1,10 @@
 # core.py
 import os
 import math
+import re
 import unicodedata
 from pathlib import Path
-from typing import Optional, Literal, Tuple
+from typing import Optional, Literal
 import pandas as pd
 
 # ----------------------------
@@ -160,30 +161,31 @@ def search(
     sort_dir: Optional[Literal["asc","desc"]] = "asc",
 ) -> pd.DataFrame:
     """
-    Server-side version of your Streamlit filtering, including:
+    Server-side filtering that mirrors the Streamlit app:
     - topic filter
     - district detection + scope ("all", "only", "nearby")
     - nearby radius with optional user coordinates
     - keyword filter
+    - improved free-text query (splits into words, matches across columns)
     - optional sort
     """
     subset = df.copy()
 
-    # infer district from query if not provided
+    # If district not provided, try to infer from query
     if (not district) and query:
         district = detect_district(query)
 
-    # topic
+    # Topic
     if topic and "type" in subset.columns:
         subset = subset[subset["type"].astype(str).str.lower() == topic]
 
-    # keyword detection (fallback to your keyword list if not given)
+    # Keyword: infer from query if not given
     if (not keyword) and query:
         keys = ["developer","engineer","data","design","marketing","teacher","python","manager"]
         ql = query.lower()
         keyword = next((k for k in keys if k in ql), None)
 
-    # district + scope
+    # District + scope
     if district:
         dkey = district.lower()
         if scope == "only":
@@ -192,7 +194,7 @@ def search(
                 | subset["location"].fillna("").str.lower().str.contains(dkey)
             ]
         elif scope == "nearby":
-            # get origin: either user-provided or district centroid
+            # Choose origin: user coords or district centroid
             if use_my_location and origin_lat is not None and origin_lon is not None:
                 lat0, lon0 = float(origin_lat), float(origin_lon)
             else:
@@ -209,28 +211,35 @@ def search(
                     mask.append(False)
             subset = subset.loc[mask]
         else:
-            # 'all' → no filtering by district
+            # scope == "all" → leave everything
             pass
 
-    # explicit keyword filter
+    # Explicit keyword filter
     if keyword:
-        cols = [c for c in ["title","company","provider","course_name"] if c in subset.columns]
+        cols = [c for c in ["title","course_name","provider","company"] if c in subset.columns]
         if cols:
             k = keyword.lower()
             subset = subset[subset[cols].apply(lambda x: x.astype(str).str.lower().str.contains(k).any(), axis=1)]
 
-    # free-text query fallback across many columns
+    # Improved free-text query: split into words and match across multiple columns
     if query:
-        q = query.lower()
-        cols = [c for c in ["title","course_name","provider","company","district","location","address"] if c in subset.columns]
-        if cols:
-            m = subset[cols].apply(lambda x: x.astype(str).str.lower().str.contains(q).any(), axis=1)
-            subset = subset[m]
+        q = query.lower().strip()
+        words = [w for w in re.split(r"\W+", q) if w]
+        if words:
+            cols = [c for c in ["title","course_name","provider","company","district","location","address"] if c in subset.columns]
+            if cols:
+                mask_any = pd.Series(False, index=subset.index)
+                for w in words:
+                    mask_any = mask_any | subset[cols].apply(
+                        lambda x: x.astype(str).str.lower().str.contains(w).any(),
+                        axis=1
+                    )
+                subset = subset[mask_any]
 
-    # ensure coords for clients that map
+    # Ensure coordinates present for clients that map
     subset = bake_coords(subset)
 
-    # optional sorting
+    # Optional sorting
     if sort_by and sort_by in subset.columns:
         subset = subset.sort_values(sort_by, ascending=(sort_dir != "desc"))
 
