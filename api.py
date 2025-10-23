@@ -16,7 +16,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:5173",
-        "https://your-react-domain.com",
+        "https://hackathon-kiez-chatbot.onrender.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
