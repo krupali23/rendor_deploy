@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+pandas
+pyarrow        # optional, only if you use parquet cache
+pydantic
