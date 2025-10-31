@@ -3,8 +3,8 @@
 💬 Kiez Connect – Backend API
 
 FastAPI backend for Kiez Connect, a Berlin-based assistant that provides data about tech jobs, events, and German courses.
-Deployed live on Render:https://hackathon-kiez-chatbot.onrender.com/
-👉 https://rendor-deploy.onrender.com
+Deployed live on Render:👉 https://hackathon-kiez-chatbot.onrender.com/
+ (https://rendor-deploy.onrender.com)
 
 🚀 Overview
 
